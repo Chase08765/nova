@@ -5,3 +5,4 @@ venv/
 *.log
 *.log.*
 combinatorial_db/molecules.sqlite
+external_tools/
