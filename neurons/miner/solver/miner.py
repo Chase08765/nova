@@ -26,7 +26,7 @@ import sys
 import json
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import List, Optional, Set
 
 import numpy as np
 import pandas as pd
@@ -37,12 +37,14 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 NOVA_DIR = os.path.abspath(os.path.join(BASE_DIR, "../../.."))
 SOLVER_46_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "solver_46"))
 for p in (NOVA_DIR, SOLVER_46_DIR, BASE_DIR):
-    if p not in sys.path:
-        sys.path.insert(0, p)
+    if p in sys.path:
+        sys.path.remove(p)
+    sys.path.insert(0, p)
 
-import nova_ph2  # noqa: E402
-from molecules import MoleculeManager, MoleculeUtils  # from solver_46
-from models import ModelManager  # from solver_46 (PSICHIC wrapper)
+from molecules import MoleculeManager, MoleculeUtils
+from models import ModelManager
+from config.config_loader import load_config as load_repo_config
+from utils.proteins import get_sequence_from_protein_code
 
 from boltz_scorer import make_oracle
 from selection import build_prior_pool, build_frontier, pick_round_batch
@@ -51,7 +53,8 @@ from surrogate import Surrogate
 
 # ─── runtime config ─────────────────────────────────────────────────────────
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/output")
-DB_PATH = str(Path(nova_ph2.__file__).resolve().parent / "combinatorial_db" / "molecules.sqlite")
+DB_PATH = str(Path(NOVA_DIR) / "combinatorial_db" / "molecules.sqlite")
+DEFAULT_CONFIG_PATH = str(Path(NOVA_DIR) / "config" / "config.yaml")
 
 TIME_LIMIT = int(os.environ.get("MINER_TIME_LIMIT", "900"))     # whole epoch budget
 PHASE1_SAMPLE = int(os.environ.get("PHASE1_SAMPLE", "4000"))     # how many to PSICHIC-score
@@ -75,12 +78,59 @@ model_manager: Optional[ModelManager] = None
 
 
 # ─── config + init ──────────────────────────────────────────────────────────
-def get_config(input_file: Optional[str] = None) -> dict:
-    if input_file is None:
-        input_file = os.path.join(BASE_DIR, "input.json")
-    with open(input_file, "r") as f:
-        d = json.load(f)
-    return {**d.get("config", {}), **d.get("challenge", {})}
+def _resolve_target_sequences(config: dict) -> list[str]:
+    sequences: list[str] = []
+    targets = list(config.get("small_molecule_target", []))
+    clips = list(config.get("small_molecule_target_clip_interval", []))
+    if len(clips) < len(targets):
+        clips.extend([None] * (len(targets) - len(clips)))
+
+    for target, clip in zip(targets, clips):
+        sequence = get_sequence_from_protein_code(target, clip_interval=clip)
+        if sequence:
+            sequences.append(sequence)
+        else:
+            bt.logging.warning(f"[Config] failed to resolve sequence for target={target}")
+    return sequences
+
+
+def _build_boltz_targets(config: dict, sequences: list[str]) -> list[dict]:
+    targets = list(config.get("small_molecule_target", []))
+    clips = list(config.get("small_molecule_target_clip_interval", []))
+    if len(clips) < len(targets):
+        clips.extend([None] * (len(targets) - len(clips)))
+
+    boltz_targets = []
+    for idx, (target, sequence) in enumerate(zip(targets, sequences)):
+        target_cfg = {
+            "name": str(target),
+            "sequence": sequence,
+        }
+        msa_map = config.get("boltz_msa_paths", {}) or {}
+        msa_path = msa_map.get(target)
+        if msa_path:
+            target_cfg["msa_path"] = msa_path
+        boltz_targets.append(target_cfg)
+    return boltz_targets
+
+
+def get_config(config_path: Optional[str] = None) -> dict:
+    path = config_path or os.environ.get("NOVA_CONFIG_PATH") or DEFAULT_CONFIG_PATH
+    config = load_repo_config(path)
+
+    target_sequences = _resolve_target_sequences(config)
+    config["target_sequences"] = target_sequences
+    config.setdefault("antitarget_sequences", [])
+    config.setdefault("entropy_min_threshold", float(config.get("min_entropy", 0.0)))
+    config.setdefault("seed", int(os.environ.get("MINER_SEED", "68")))
+    config.setdefault("rxn_id", 2)
+    config.setdefault("boltz_targets", _build_boltz_targets(config, target_sequences))
+
+    bt.logging.info(
+        f"[Config] loaded {path} targets={config.get('small_molecule_target', [])} "
+        f"resolved_sequences={len(target_sequences)}"
+    )
+    return config
 
 
 def initialize_solution(config: dict) -> None:
@@ -120,6 +170,50 @@ def _save_result(names: List[str]) -> None:
     with open(path, "w") as f:
         json.dump({"molecules": names}, f, ensure_ascii=False, indent=2)
     bt.logging.info(f"[Submit] wrote {len(names)} molecule(s) → {path}")
+
+
+def _candidate_dir() -> str:
+    path = os.path.join(OUTPUT_DIR, "candidates")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _snapshot_names(df: pd.DataFrame) -> Set[str]:
+    if df.empty or "name" not in df.columns:
+        return set()
+    return set(df["name"].dropna().astype(str).tolist())
+
+
+def _save_candidates_snapshot(
+    stage: str,
+    df: pd.DataFrame,
+    previous_names: Optional[Set[str]] = None,
+) -> Set[str]:
+    path = os.path.join(_candidate_dir(), f"{stage}.csv")
+    snapshot = df.copy()
+    if not snapshot.empty:
+        snapshot = snapshot.reset_index(drop=True)
+    snapshot.to_csv(path, index=False)
+
+    current_names = _snapshot_names(snapshot)
+    prev = previous_names or set()
+    added = current_names - prev
+    removed = prev - current_names
+    changed = len(added) + len(removed)
+    bt.logging.info(
+        f"[Trace] {stage}: count={len(snapshot)} changed={changed} "
+        f"added={len(added)} removed={len(removed)} → {path}"
+    )
+    return current_names
+
+
+def _save_name_list_snapshot(
+    stage: str,
+    names: List[str],
+    previous_names: Optional[Set[str]] = None,
+) -> Set[str]:
+    frame = pd.DataFrame({"name": names})
+    return _save_candidates_snapshot(stage, frame, previous_names=previous_names)
 
 
 def _pick_final(
@@ -186,6 +280,7 @@ def find_solution(config: dict, time_start: float) -> None:
 
     deadline = time_start + TIME_LIMIT
     oracle = make_oracle(config, model_manager)
+    last_snapshot_names: Set[str] = set()
 
     # ---- Phase 1 ---------------------------------------------------------------
     prior = build_prior_pool(
@@ -195,6 +290,7 @@ def find_solution(config: dict, time_start: float) -> None:
     if prior.empty:
         bt.logging.error("[Solve] Phase 1 produced empty pool; aborting")
         return
+    last_snapshot_names = _save_candidates_snapshot("phase1_prior", prior, last_snapshot_names)
 
     # ---- Phase 2 ---------------------------------------------------------------
     frontier = build_frontier(
@@ -207,6 +303,7 @@ def find_solution(config: dict, time_start: float) -> None:
     if frontier.empty:
         bt.logging.error("[Solve] Phase 2 produced empty frontier; aborting")
         return
+    last_snapshot_names = _save_candidates_snapshot("phase2_frontier", frontier, last_snapshot_names)
 
     # ---- Phase 3 ---------------------------------------------------------------
     surrogate = Surrogate(min_train=4)
@@ -241,6 +338,11 @@ def find_solution(config: dict, time_start: float) -> None:
         if batch.empty:
             bt.logging.warning(f"[Phase3] round {round_i}: empty pick — stopping")
             break
+        last_snapshot_names = _save_candidates_snapshot(
+            f"phase3_round_{round_i:02d}_batch",
+            batch,
+            last_snapshot_names,
+        )
 
         t0 = time.time()
         scores = oracle.score(batch["smiles"].tolist())
@@ -263,14 +365,26 @@ def find_solution(config: dict, time_start: float) -> None:
 
         # incremental save so we always have *something* submittable
         df_eval = pd.DataFrame(evaluated)
+        last_snapshot_names = _save_candidates_snapshot(
+            f"phase3_round_{round_i:02d}_evaluated",
+            df_eval,
+            last_snapshot_names,
+        )
         partial = _pick_final(df_eval, config)
         if partial:
+            last_snapshot_names = _save_name_list_snapshot(
+                f"phase3_round_{round_i:02d}_partial_result",
+                partial,
+                last_snapshot_names,
+            )
             _save_result(partial)
 
     # ---- Phase 4 (final) ------------------------------------------------------
     df_eval = pd.DataFrame(evaluated)
+    last_snapshot_names = _save_candidates_snapshot("phase4_evaluated", df_eval, last_snapshot_names)
     final = _pick_final(df_eval, config)
     if final:
+        last_snapshot_names = _save_name_list_snapshot("phase4_final_result", final, last_snapshot_names)
         _save_result(final)
     else:
         # last-ditch: pure prior top
@@ -279,6 +393,7 @@ def find_solution(config: dict, time_start: float) -> None:
             frontier.sort_values("prior", ascending=False)
             .head(int(config.get("num_molecules", 1)))["name"].tolist()
         )
+        last_snapshot_names = _save_name_list_snapshot("phase4_fallback_result", fallback, last_snapshot_names)
         _save_result(fallback)
 
     bt.logging.info(

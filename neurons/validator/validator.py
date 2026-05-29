@@ -361,7 +361,7 @@ async def main(config):
                     last_logged_blocks_remaining = blocks_remaining
                 await asyncio.sleep(1)
                 
- 
+
         except asyncio.CancelledError:
             bt.logging.info("Resetting subtensor connection.")
             subtensor = await reconnect_subtensor(subtensor, config.network)

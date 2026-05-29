@@ -24,9 +24,122 @@ import shutil
 import glob
 import hashlib
 import traceback
+import multiprocessing as mp
 from typing import List, Optional
 
 import bittensor as bt
+
+
+def _score_chunk_worker(payload: dict) -> dict:
+    gpu_token = payload["gpu_token"]
+    smiles_list = payload["smiles_list"]
+    targets = payload["targets"]
+    combination_strategy = payload["combination_strategy"]
+    boltz_metric = payload["boltz_metric"]
+    base_seed = payload["base_seed"]
+    boltz_mode = payload["boltz_mode"]
+    input_dir = payload["input_dir"]
+    output_dir = payload["output_dir"]
+    predict_kwargs = payload["predict_kwargs"]
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_token)
+
+    try:
+        from boltz.main import predict
+        from rdkit import Chem
+    except Exception as e:
+        return {"ok": False, "error": f"worker import failed on gpu={gpu_token}: {e}", "scores": []}
+
+    def mol_idx(smiles: str) -> int:
+        h = hashlib.sha256(smiles.encode()).digest()
+        return (int.from_bytes(h[:8], "little") ^ base_seed) % (2**31 - 1)
+
+    def yaml_text(target: dict, ligand_smiles: str) -> str:
+        msa_line = f"\n      msa: {target['msa_path']}" if target.get("msa_path") else ""
+        return (
+            "version: 1\n"
+            "sequences:\n"
+            "  - protein:\n"
+            "      id: A\n"
+            f"      sequence: {target['sequence']}{msa_line}\n"
+            "  - ligand:\n"
+            "      id: B\n"
+            f"      smiles: {ligand_smiles}\n"
+            "properties:\n"
+            "  - affinity:\n"
+            "      binder: B\n"
+        )
+
+    def load_metrics(chunk_output_dir: str, local_mol_idx: int, target_name: str) -> dict:
+        results_path = os.path.join(
+            chunk_output_dir,
+            "boltz_results_inputs",
+            "predictions",
+            f"{local_mol_idx}_{target_name}",
+        )
+        out = {}
+        if not os.path.exists(results_path):
+            return out
+        for fn in os.listdir(results_path):
+            if fn.startswith("affinity") or fn.startswith("confidence"):
+                try:
+                    with open(os.path.join(results_path, fn)) as f:
+                        out.update(json.load(f))
+                except (json.JSONDecodeError, IOError):
+                    continue
+        return out
+
+    def combine(metrics: dict, smiles: str) -> Optional[float]:
+        if not metrics:
+            return None
+        try:
+            if combination_strategy == "average":
+                vals = [metrics[m] for m in boltz_metric if m in metrics]
+                return float(sum(vals) / len(vals)) if vals else None
+            if combination_strategy == "heavy_atom_normalization":
+                if len(boltz_metric) < 2:
+                    return None
+                mol = Chem.MolFromSmiles(smiles)
+                heavy = mol.GetNumHeavyAtoms() if mol is not None else 0
+                if heavy == 0:
+                    return None
+                m1, m2 = boltz_metric[0], boltz_metric[1]
+                if m1 not in metrics or m2 not in metrics:
+                    return None
+                return float((metrics[m1] - metrics[m2]) / heavy)
+            return None
+        except Exception:
+            return None
+
+    os.makedirs(input_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
+
+    smiles_to_idx = {}
+    for smiles in smiles_list:
+        local_mol_idx = mol_idx(smiles)
+        smiles_to_idx[smiles] = local_mol_idx
+        for target in targets:
+            path = os.path.join(input_dir, f"{local_mol_idx}_{target['name']}.yaml")
+            with open(path, "w") as f:
+                f.write(yaml_text(target, smiles))
+
+    try:
+        predict(data=input_dir, out_dir=output_dir, **predict_kwargs)
+    except Exception as e:
+        return {"ok": False, "error": f"predict failed on gpu={gpu_token}: {e}", "scores": [None] * len(smiles_list)}
+
+    scores = []
+    for smiles in smiles_list:
+        local_mol_idx = smiles_to_idx[smiles]
+        per_target = []
+        for target in targets:
+            metrics = load_metrics(output_dir, local_mol_idx, target["name"])
+            score = combine(metrics, smiles)
+            if score is not None:
+                per_target.append(score)
+        scores.append(float(sum(per_target) / len(per_target)) if per_target else None)
+
+    return {"ok": True, "gpu": gpu_token, "scores": scores}
 
 
 # ─── factory ─────────────────────────────────────────────────────────────────
@@ -94,9 +207,9 @@ class BoltzGpuScorer(BaseOracle):
 
     def __init__(self, config: dict):
         # lazy imports: do not require boltz/torch at module import time
-        import torch  # noqa: F401
+        import torch
         from boltz.main import predict  # noqa: F401
-        self._predict = predict
+        self._torch = torch
 
         self.targets = config.get("boltz_targets") or []
         if not self.targets:
@@ -119,6 +232,7 @@ class BoltzGpuScorer(BaseOracle):
         self.affinity_mw_correction    = bool(config.get("boltz_affinity_mw_correction", False))
         self.override                  = bool(config.get("boltz_override", True))
         self.base_seed                 = int(config.get("boltz_seed", 68))
+        self.max_gpu_workers           = max(1, int(config.get("boltz_max_gpu_workers", 8)))
 
         # tmp dirs — kept separate from validator's tree
         base = os.path.dirname(os.path.abspath(__file__))
@@ -128,70 +242,39 @@ class BoltzGpuScorer(BaseOracle):
         os.makedirs(self.input_dir, exist_ok=True)
         os.makedirs(self.output_dir, exist_ok=True)
 
+        self.predict_kwargs = {
+            "recycling_steps": self.recycling_steps,
+            "sampling_steps": self.sampling_steps,
+            "diffusion_samples": self.diffusion_samples,
+            "sampling_steps_affinity": self.sampling_steps_affinity,
+            "diffusion_samples_affinity": self.diffusion_samples_affinity,
+            "output_format": self.output_format,
+            "seed": self.base_seed,
+            "affinity_mw_correction": self.affinity_mw_correction,
+            "override": self.override,
+            "num_workers": 0,
+        }
+        self.gpu_tokens = self._discover_gpu_tokens()
+        self.seconds_per_call = 45.0 / max(1, len(self.gpu_tokens))
+
         bt.logging.info(
             f"[BoltzGpuScorer] init: {len(self.targets)} target(s), "
-            f"strategy={self.combination_strategy}, metric={self.boltz_metric}, mode={self.boltz_mode}"
+            f"strategy={self.combination_strategy}, metric={self.boltz_metric}, mode={self.boltz_mode}, "
+            f"gpus={self.gpu_tokens}"
         )
 
     # ---- public API ---------------------------------------------------------
     def score(self, smiles_list: List[str]) -> List[Optional[float]]:
         if not smiles_list:
             return []
-        bt.logging.info(f"[BoltzGpuScorer] scoring {len(smiles_list)} molecule(s) on GPU …")
-
-        # 1. write yaml inputs (per molecule × per target)
-        self._cleanup_inputs()
-        smiles_to_idx = {}
-        for smi in smiles_list:
-            mol_idx = self._mol_idx(smi)
-            smiles_to_idx[smi] = mol_idx
-            for tgt in self.targets:
-                yaml_str = self._yaml(tgt, smi)
-                path = os.path.join(self.input_dir, f"{mol_idx}_{tgt['name']}.yaml")
-                with open(path, "w") as f:
-                    f.write(yaml_str)
-
-        # 2. run Boltz
-        try:
-            self._predict(
-                data=self.input_dir,
-                out_dir=self.output_dir,
-                recycling_steps=self.recycling_steps,
-                sampling_steps=self.sampling_steps,
-                diffusion_samples=self.diffusion_samples,
-                sampling_steps_affinity=self.sampling_steps_affinity,
-                diffusion_samples_affinity=self.diffusion_samples_affinity,
-                output_format=self.output_format,
-                seed=self.base_seed,
-                affinity_mw_correction=self.affinity_mw_correction,
-                override=self.override,
-                num_workers=0,
+        if len(self.gpu_tokens) <= 1 or len(smiles_list) <= 1:
+            bt.logging.info(f"[BoltzGpuScorer] scoring {len(smiles_list)} molecule(s) on 1 GPU")
+            out = self._score_serial(smiles_list)
+        else:
+            bt.logging.info(
+                f"[BoltzGpuScorer] scoring {len(smiles_list)} molecule(s) across {len(self.gpu_tokens)} GPUs"
             )
-        except Exception as e:
-            bt.logging.error(f"[BoltzGpuScorer] predict() failed: {e}")
-            bt.logging.error(traceback.format_exc())
-            return [None] * len(smiles_list)
-
-        # 3. collect + combine scores
-        out: List[Optional[float]] = []
-        for smi in smiles_list:
-            mol_idx = smiles_to_idx[smi]
-            try:
-                per_target = []
-                for tgt in self.targets:
-                    metrics = self._load_metrics(mol_idx, tgt["name"])
-                    score = self._combine(metrics, smi)
-                    if score is not None:
-                        per_target.append(score)
-                if not per_target:
-                    out.append(None)
-                else:
-                    # validator averages per-target then sums; for a single mol the
-                    # average is the right per-molecule scalar.
-                    out.append(float(sum(per_target) / len(per_target)))
-            except Exception as e:
-                bt.logging.warning(f"[BoltzGpuScorer] score-collect failed for {smi}: {e}")
-                out.append(None)
+            out = self._score_parallel(smiles_list)
 
         good = sum(1 for v in out if v is not None)
         bt.logging.info(f"[BoltzGpuScorer] done: {good}/{len(out)} scored")
@@ -217,6 +300,97 @@ class BoltzGpuScorer(BaseOracle):
             "  - affinity:\n"
             "      binder: B\n"
         )
+
+    def _discover_gpu_tokens(self) -> List[str]:
+        env = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if env:
+            tokens = [token.strip() for token in env.split(",") if token.strip()]
+            return tokens[: self.max_gpu_workers] or ["0"]
+
+        count = int(self._torch.cuda.device_count())
+        if count <= 0:
+            return ["0"]
+        return [str(i) for i in range(min(count, self.max_gpu_workers))]
+
+    def _score_serial(self, smiles_list: List[str]) -> List[Optional[float]]:
+        self._cleanup_inputs()
+        smiles_to_idx = {}
+        for smi in smiles_list:
+            mol_idx = self._mol_idx(smi)
+            smiles_to_idx[smi] = mol_idx
+            for tgt in self.targets:
+                yaml_str = self._yaml(tgt, smi)
+                path = os.path.join(self.input_dir, f"{mol_idx}_{tgt['name']}.yaml")
+                with open(path, "w") as f:
+                    f.write(yaml_str)
+
+        try:
+            from boltz.main import predict
+
+            predict(data=self.input_dir, out_dir=self.output_dir, **self.predict_kwargs)
+        except Exception as e:
+            bt.logging.error(f"[BoltzGpuScorer] predict() failed: {e}")
+            bt.logging.error(traceback.format_exc())
+            return [None] * len(smiles_list)
+
+        out: List[Optional[float]] = []
+        for smi in smiles_list:
+            mol_idx = smiles_to_idx[smi]
+            try:
+                per_target = []
+                for tgt in self.targets:
+                    metrics = self._load_metrics(mol_idx, tgt["name"])
+                    score = self._combine(metrics, smi)
+                    if score is not None:
+                        per_target.append(score)
+                out.append(float(sum(per_target) / len(per_target)) if per_target else None)
+            except Exception as e:
+                bt.logging.warning(f"[BoltzGpuScorer] score-collect failed for {smi}: {e}")
+                out.append(None)
+        return out
+
+    def _score_parallel(self, smiles_list: List[str]) -> List[Optional[float]]:
+        chunks: List[List[tuple[int, str]]] = [[] for _ in self.gpu_tokens]
+        for idx, smiles in enumerate(smiles_list):
+            chunks[idx % len(self.gpu_tokens)].append((idx, smiles))
+
+        payloads = []
+        for worker_idx, (gpu_token, chunk) in enumerate(zip(self.gpu_tokens, chunks)):
+            if not chunk:
+                continue
+            input_dir = os.path.join(self.tmp_dir, f"inputs_gpu_{gpu_token}_{worker_idx}")
+            output_dir = os.path.join(self.tmp_dir, f"outputs_gpu_{gpu_token}_{worker_idx}")
+            self._cleanup_dir(input_dir, "*.yaml")
+            self._cleanup_dir(output_dir)
+            payloads.append(
+                {
+                    "gpu_token": gpu_token,
+                    "indices": [idx for idx, _ in chunk],
+                    "smiles_list": [smiles for _, smiles in chunk],
+                    "targets": self.targets,
+                    "combination_strategy": self.combination_strategy,
+                    "boltz_metric": self.boltz_metric,
+                    "base_seed": self.base_seed,
+                    "boltz_mode": self.boltz_mode,
+                    "input_dir": input_dir,
+                    "output_dir": output_dir,
+                    "predict_kwargs": self.predict_kwargs,
+                }
+            )
+
+        ctx = mp.get_context("spawn")
+        results: List[Optional[float]] = [None] * len(smiles_list)
+        with ctx.Pool(processes=len(payloads)) as pool:
+            worker_results = pool.map(_score_chunk_worker, payloads)
+
+        for payload, worker_result in zip(payloads, worker_results):
+            indices = payload["indices"]
+            if not worker_result.get("ok"):
+                bt.logging.error(f"[BoltzGpuScorer] {worker_result.get('error')}")
+                continue
+            for idx, score in zip(indices, worker_result.get("scores", [])):
+                results[idx] = score
+        return results
 
     def _load_metrics(self, mol_idx: int, target_name: str) -> dict:
         results_path = os.path.join(
@@ -266,14 +440,22 @@ class BoltzGpuScorer(BaseOracle):
 
     def _cleanup_inputs(self) -> None:
         # reset between rounds so stale yamls don't get re-predicted
-        for p in glob.glob(os.path.join(self.input_dir, "*.yaml")):
+        self._cleanup_dir(self.input_dir, "*.yaml")
+        self._cleanup_dir(self.output_dir)
+
+    def _cleanup_dir(self, path: str, pattern: Optional[str] = None) -> None:
+        if pattern is not None:
+            os.makedirs(path, exist_ok=True)
+            for item in glob.glob(os.path.join(path, pattern)):
+                try:
+                    os.remove(item)
+                except OSError:
+                    pass
+            return
+
+        if os.path.exists(path):
             try:
-                os.remove(p)
-            except OSError:
-                pass
-        res = os.path.join(self.output_dir, "boltz_results_inputs")
-        if os.path.exists(res):
-            try:
-                shutil.rmtree(res)
+                shutil.rmtree(path)
             except OSError as e:
-                bt.logging.warning(f"[BoltzGpuScorer] cleanup failed: {e}")
+                bt.logging.warning(f"[BoltzGpuScorer] cleanup failed for {path}: {e}")
+        os.makedirs(path, exist_ok=True)
